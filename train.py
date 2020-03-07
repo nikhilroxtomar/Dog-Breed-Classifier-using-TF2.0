@@ -4,27 +4,20 @@ import numpy as np
 import pandas as pd
 import cv2
 from glob import glob
+
 import tensorflow as tf
 from tensorflow.keras.layers import *
 from tensorflow.keras.applications import MobileNetV2
 from tensorflow.keras.callbacks import ModelCheckpoint, ReduceLROnPlateau
-from tensorflow.keras.optimizers import SGD, Adam
-from keras import backend as K
+from tensorflow.keras.optimizers import Adam
+
 from sklearn.model_selection import train_test_split
 
-def read_image(path, size):
-    image = cv2.imread(path, cv2.IMREAD_COLOR)
-    image = cv2.resize(image, (size, size))
-    image = image / 255.0
-    image = image.astype(np.float32)
-    return image
-
-def build_model(size, num_classes=120, trainable=False):
+def build_model(size, num_classes):
     inputs = Input((size, size, 3))
     backbone = MobileNetV2(input_tensor=inputs, include_top=False, weights="imagenet")
-    backbone.trainable = trainable
+    backbone.trainable = True
     x = backbone.output
-
     x = GlobalAveragePooling2D()(x)
     x = Dropout(0.2)(x)
     x = Dense(1024, activation="relu")(x)
@@ -33,71 +26,94 @@ def build_model(size, num_classes=120, trainable=False):
     model = tf.keras.Model(inputs, x)
     return model
 
+def read_image(path, size):
+    image = cv2.imread(path, cv2.IMREAD_COLOR)
+    image = cv2.resize(image, (size, size))
+    image = image / 255.0
+    image = image.astype(np.float32)
+    return image
+
+def parse_data(x, y):
+    x = x.decode()
+
+    num_class = 120
+    size = 224
+
+    image = read_image(x, size)
+    label = [0] * num_class
+    label[y] = 1
+    label = np.array(label)
+    label = label.astype(np.int32)
+
+    return image, label
+
 def tf_parse(x, y):
-    def _prase(x, y):
-        x = x.decode()
-
-        num_classes = 120
-        size = 224
-        image = read_image(x, size)
-        label = [0] * num_classes
-        label[y] = 1
-        label = np.array(label, dtype=np.int32)
-
-        return image, label
-
-    return tf.numpy_function(_prase, [x, y], [tf.float32, tf.int32])
+    x, y = tf.numpy_function(parse_data, [x, y], [tf.float32, tf.int32])
+    x.set_shape((224, 224, 3))
+    y.set_shape((120))
+    return x, y
 
 def tf_dataset(x, y, batch=8):
     dataset = tf.data.Dataset.from_tensor_slices((x, y))
     dataset = dataset.map(tf_parse)
     dataset = dataset.batch(batch)
+    dataset = dataset.repeat()
     return dataset
 
 if __name__ == "__main__":
     path = "Dog Breed Identification/"
     train_path = os.path.join(path, "train/*")
+    test_path = os.path.join(path, "test/*")
     labels_path = os.path.join(path, "labels.csv")
 
     labels_df = pd.read_csv(labels_path)
     breed = labels_df["breed"].unique()
-    print("Number of Breeds: ", len(breed))
-    breed2id = {name:i for i, name in enumerate(breed)}
+    print("Number of Breed: ", len(breed))
 
-    images = glob(train_path)
+    breed2id = {name: i for i, name in enumerate(breed)}
+
+    ids = glob(train_path)
     labels = []
-    for image_path in images:
-        image_id = image_path.split("/")[-1].split(".")[0]
+
+    for image_id in ids:
+        image_id = image_id.split("/")[-1].split(".")[0]
         breed_name = list(labels_df[labels_df.id == image_id]["breed"])[0]
         breed_idx = breed2id[breed_name]
         labels.append(breed_idx)
 
-    ##
-    images = images[:2000]
-    labels = labels[:2000]
+    ids = ids[:1000]
+    labels = labels[:1000]
 
-    ## Spliting b/w training and testing data
-    train_x, valid_x = train_test_split(images, test_size=0.2, random_state=42)
+    ## Spliting the dataset
+    train_x, valid_x = train_test_split(ids, test_size=0.2, random_state=42)
     train_y, valid_y = train_test_split(labels, test_size=0.2, random_state=42)
 
-    ## Hyperparameters
+    ## Parameters
     size = 224
-    num_classes = len(breed)
+    num_classes = 120
     lr = 1e-4
     batch = 16
-    epochs = 5
+    epochs = 10
 
     ## Model
-    model = build_model(size, num_classes=num_classes, trainable=False)
+    model = build_model(size, num_classes)
     model.compile(loss="categorical_crossentropy", optimizer=Adam(lr), metrics=["acc"])
+    # model.summary()
 
     ## Dataset
-    train_dataset = tf_dataset(train_x, train_y)
-    valid_dataset = tf_dataset(valid_x, valid_y)
+    train_dataset = tf_dataset(train_x, train_y, batch=batch)
+    valid_dataset = tf_dataset(valid_x, valid_y, batch=batch)
 
     ## Training
     callbacks = [
-        ModelCheckpoint("model.h5", verbose=1),
+        ModelCheckpoint("model.h5", verbose=1, save_best_only=True),
         ReduceLROnPlateau(factor=0.1, patience=5, min_lr=1e-6)
     ]
-    model.fit(train_dataset, validation_data=valid_dataset, epochs=epochs, callbacks=callbacks)
+    train_steps = (len(train_x)//batch) + 1
+    valid_steps = (len(valid_x)//batch) + 1
+    model.fit(train_dataset,
+        steps_per_epoch=train_steps,
+        validation_steps=valid_steps,
+        validation_data=valid_dataset,
+        epochs=epochs,
+        callbacks=callbacks)
